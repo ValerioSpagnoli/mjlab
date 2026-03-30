@@ -68,6 +68,42 @@ HOME_QPOS: dict[str, float] = {
 STANDING_BASE_POS = (0.0, 0.0, 0.665)
 STANDING_BASE_QUAT = (1.0, 0.0, 0.0, 0.0)
 
+# RealSense-like calibrated intrinsics.
+REAL_CAM_NAME = "d455_color"
+REAL_CAM_WIDTH = 1280
+REAL_CAM_HEIGHT = 720
+REAL_CAM_K = np.array(
+  [
+    [646.0612, 0.0, 644.3064],
+    [0.0, 645.1986, 357.1254],
+    [0.0, 0.0, 1.0],
+  ],
+  dtype=np.float64,
+)
+
+
+def _fovy_from_intrinsics(height: int, fy: float) -> float:
+  return float(np.degrees(2.0 * np.arctan(height / (2.0 * fy))))
+
+
+def _set_mujoco_camera_intrinsics(
+  cam: mujoco.MjsCamera,
+  width: int,
+  height: int,
+  fx: float,
+  fy: float,
+  cx: float,
+  cy: float,
+) -> None:
+  cam.resolution[:] = (width, height)
+  # Exact intrinsics when available.
+  if hasattr(cam, "focalpixel") and hasattr(cam, "principalpixel"):
+    setattr(cam, "focalpixel", np.array([fx, fy], dtype=np.float64))
+    setattr(cam, "principalpixel", np.array([cx, cy], dtype=np.float64))
+  else:
+    # Fallback to FOV-only if this MuJoCo build lacks focalpixel support.
+    cam.fovy = _fovy_from_intrinsics(height=height, fy=fy)
+
 
 class BoosterT1RgbdEnv(ManagerBasedRlEnv):
   """ManagerBasedRlEnv with debug frame overlays for axis visualization."""
@@ -195,7 +231,28 @@ def _resolve_t1_xml_path(t1_xml: str | None) -> Path:
 def _get_t1_spec(xml_path: Path) -> mujoco.MjSpec:
   # The XML references meshes via <compiler meshdir="meshes">; loading from file
   # keeps those paths resolved relative to the XML folder.
-  return mujoco.MjSpec.from_file(str(xml_path))
+  spec = mujoco.MjSpec.from_file(str(xml_path))
+
+  # Add calibrated camera to the H2 head link.
+  h2 = spec.body("H2")
+  cam = h2.add_camera(
+    name=REAL_CAM_NAME,
+    pos=(0.074, 0.0, 0.11),
+    quat=(0.5, 0.5, -0.5, -0.5),
+    fovy=_fovy_from_intrinsics(height=REAL_CAM_HEIGHT, fy=float(REAL_CAM_K[1, 1])),
+    resolution=[REAL_CAM_WIDTH, REAL_CAM_HEIGHT],
+    proj=mujoco.mjtProjection.mjPROJ_PERSPECTIVE,
+  )
+  _set_mujoco_camera_intrinsics(
+    cam=cam,
+    width=REAL_CAM_WIDTH,
+    height=REAL_CAM_HEIGHT,
+    fx=float(REAL_CAM_K[0, 0]),
+    fy=float(REAL_CAM_K[1, 1]),
+    cx=float(REAL_CAM_K[0, 2]),
+    cy=float(REAL_CAM_K[1, 2]),
+  )
+  return spec
 
 
 def _get_world_spec() -> mujoco.MjSpec:
@@ -231,15 +288,10 @@ def create_env_cfg(
   world_cfg = EntityCfg()
   world_cfg.spec_fn = _get_world_spec
 
-  # Head-mounted camera attached to booster/H2.
-  # Body names are entity-prefixed in scene construction.
+  # Wrap calibrated camera defined in _get_t1_spec().
   rgbd_sensor_cfg = CameraSensorCfg(
     name="head_rgbd",
-    parent_body="booster/H2",
-    pos=(0.074, 0.0, 0.11), # x y z of the head
-    # Forward-facing + landscape: -90 deg around Y, then -90 deg roll.
-    quat=(0.5, 0.5, -0.5, -0.5),
-    fovy=70.0,
+    camera_name=f"booster/{REAL_CAM_NAME}",
     width=width,
     height=height,
     data_types=("rgb", "depth"),
@@ -324,6 +376,16 @@ def main(
   print(f"  Device: {device}")
   print(f"  Viewer: {resolved_viewer}")
   print(f"  Sensor resolution: {width}x{height}")
+  print(
+    "  Camera intrinsics K: "
+    f"fx={REAL_CAM_K[0, 0]:.4f}, fy={REAL_CAM_K[1, 1]:.4f}, "
+    f"cx={REAL_CAM_K[0, 2]:.4f}, cy={REAL_CAM_K[1, 2]:.4f}"
+  )
+  print(
+    "  FOV from K: "
+    f"fovx={np.degrees(2.0 * np.arctan(width / (2.0 * REAL_CAM_K[0, 0]))):.3f} deg, "
+    f"fovy={np.degrees(2.0 * np.arctan(height / (2.0 * REAL_CAM_K[1, 1]))):.3f} deg"
+  )
   print("  Stance lock: enabled (robot kept standing while head scans)")
   print("  Debug axes: world + booster body + camera")
   if gravity_zero:
@@ -393,8 +455,12 @@ if __name__ == "__main__":
     default=None,
     help="Absolute path to Booster T1 XML (T1_23dof.xml).",
   )
-  parser.add_argument("--width", type=int, default=320, help="Camera width.")
-  parser.add_argument("--height", type=int, default=240, help="Camera height.")
+  parser.add_argument(
+    "--width", type=int, default=REAL_CAM_WIDTH, help="Camera width."
+  )
+  parser.add_argument(
+    "--height", type=int, default=REAL_CAM_HEIGHT, help="Camera height."
+  )
   parser.add_argument(
     "--gravity-zero",
     action="store_true",
